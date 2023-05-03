@@ -1,9 +1,16 @@
 import requests
-from requests.auth import HTTPDigestAuth
-from datetime import datetime, date, timedelta
 import json
 import humanize
-from os import path
+import signal
+import sys
+from asyncio import Semaphore, run as asyncRun
+from datetime import datetime, date, timedelta
+# from multiprocessing import Process
+from time import sleep, time
+from threading import Thread
+from queue import Queue
+from requests.auth import HTTPDigestAuth
+from os import path, makedirs, remove
 
 class SwannAPI():
     csrfTokenKey: str = "X-csrftoken"
@@ -24,10 +31,11 @@ class SwannAPI():
         # authentication. This is very important to keep in mind.
         self.auth = HTTPDigestAuth(self.userName, self.password)
         self.__loggedIn: bool = False
+        self.__heartbeatThread: Thread = Thread(target=self.__MaintainHeartbeat)
 
     # TODO: BMG (Apr. 29, 2023) Might be a good idea to try to get this destructor working at some point.
-    # def __del__(self):
-    #     self.__Logout()
+    def __del__(self):
+        self.Logout()
 
     def GetURLEndpoint(self, APIEndpoint: str) -> str:
         return f"{self.baseUrl}/{APIEndpoint}"
@@ -46,8 +54,8 @@ class SwannAPI():
         else:
             return response
 
-    def __StreamAPIDownloadToFile(self, downloadTarget: str, expectedFileSize: int, apiURL: str, payload: dict[str, any], headers: dict[str, str] | None = None):
-        print(f"Starting download of {humanize.naturalsize(expectedFileSize)}:")
+    def __StreamAPIDownloadToFile(self, downloadTarget: str, expectedFileSize: int, apiURL: str, payload: dict[str, any], headers: dict[str, str] | None = None, stdout: bool = True):
+        if stdout: print(f"Starting download of {humanize.naturalsize(expectedFileSize)}:")
         fileDownloadProgress: int = 0
         fileDownloadPercentageDelta: int = 10
         fileDownloadPercentage: int = fileDownloadPercentageDelta
@@ -60,30 +68,36 @@ class SwannAPI():
                     # from the value we are using for comparison to make sure that the floating point precision doesn't
                     # cause the 100% console print to occur twice.
                     if (float(fileDownloadProgress) / expectedFileSize * 100 - 0.1) > fileDownloadPercentage:
-                        print(f"  Download Progress: {fileDownloadPercentage}%")
+                        if stdout: print(f"  Download Progress: {fileDownloadPercentage}%")
                         fileDownloadPercentage += fileDownloadPercentageDelta
                     file.write(chunk)
 
-        print(f"  Download Progress: 100%")
+        if stdout: print(f"  Download Progress: 100%")
 
     def __Login(self):
         loginUrl: str = self.GetURLEndpoint("API/Web/Login")
         payload = {"data":{"remote_terminal_info":"WEB,chrome"}}
 
         response = self.__session.post(loginUrl, data=json.dumps(payload), auth=self.auth)
-        self.__session.headers[SwannAPI.csrfTokenKey] = response.headers[SwannAPI.csrfTokenKey]
         if response.ok:
+            self.__session.headers[SwannAPI.csrfTokenKey] = response.headers[SwannAPI.csrfTokenKey]
             self.__loggedIn = True
+            self.__heartbeatThread.start()
         else:
-            raise Exception("Unable to successfully login to the Device.")
+            responseObject = json.loads(response.text)
+            reasonMessage = json.loads(response.text)["reason"] if "reason" in responseObject else SwannAPI.__error_code[responseObject["error_code"]]
+            raise Exception(f"Unable to successfully login to the Device. {reasonMessage}")
 
     def __EnsureLogin(self):
         if not self.__loggedIn:
             self.__Login()
 
-    def __Logout(self):
+    def Logout(self):
         if not self.__loggedIn:
             return
+
+        # Set the logged in flag to false before we continue to stop the heartbeat from sending anything.
+        self.__loggedIn = False
 
         currentApiDateString: str = datetime.now().strftime("%Y-%m-%d@%H:%M:%S")
         apiUrl: str = self.GetURLEndpoint(f"API/Web/Logout?{currentApiDateString}")
@@ -104,6 +118,16 @@ class SwannAPI():
         apiUrl: str = self.GetURLEndpointWithTimestamp(f"API/Login/DeviceInfo/Get")
         return json.loads(self.__GetAPIResponse(apiUrl, payload={}).text)
 
+    def DoHeartbeat(self):
+        print("Sending Heartbeat")
+        apiUrl: str = self.GetURLEndpointWithTimestamp(f"API/Login/Heartbeat")
+        return json.loads(self.__GetAPIResponse(apiUrl, payload={"version":"1.0","data":{},"actionType":"create"}).text)
+
+    def __MaintainHeartbeat(self):
+        while self.__loggedIn:
+            self.DoHeartbeat()
+            sleep(10)
+
     def SearchPlaybackRecords(self, channelIndex: int, searchDate: date) -> dict[str, str]:
         self.__EnsureLogin()
 
@@ -114,13 +138,17 @@ class SwannAPI():
         payload = {
             "version":"1.0",
             "data":{
+                # TODO: BMG (Apr. 30, 2023) In theory it looks like this API might support querying for videos of
+                # multiple channels at the same time. At some point it might be worth updating this function to check
+                # that the channel passed through is a channel that is actually active on the system, and if a channel
+                # number of 0 is passed through we'll just query for all channels on the unit.
                 "channel": [f"CH{channelIndex}"],
                 "start_date": searchDateString,
                 "start_time": "00:00:00",
                 "end_date": searchDateString,
                 "end_time": "23:59:59",
-                "record_type": 1, # This record type indicates that we are looking for "Normal video clips"
-                # "record_type": 128, # This record type indicates that we are looking for "Intelligent video clips"
+                # "record_type": 1, # This record type indicates that we are looking for "Normal video clips"
+                "record_type": 128, # This record type indicates that we are looking for "Intelligent video clips"
                 "smart_region": [],
                 "enable_smart_search": 0,
                 "stream_mode": "Mainstream"
@@ -144,31 +172,64 @@ class SwannAPI():
         day: str = dateString[3:5]
         return f"{year}{month}{day}{timeString.replace(':', '')}"
 
-    def DownloadVideoFile(self, recordOfInterest: dict[str, str | int], downloadDir: str):
+    @staticmethod
+    def GetVideoFileName(recordOfInterest: dict[str, str | int]) -> str:
+        """
+        This function is going to generate the name of the video file that is going to be downloaded. This function is
+        meant to standardize the naming of the file and to make sure that the resulting file has all the information
+        that would be pertinant to the person browing the directory.
+        """
+        channel: str        = SwannAPI.__ValidateRecordField(recordOfInterest, "channel")
+        start_date: str     = SwannAPI.__ValidateRecordField(recordOfInterest, "start_date")
+        start_year: str     = start_date[6:]
+        start_month: str    = start_date[0:2]
+        start_day: str      = start_date[3:5]
+        start_time: str     = SwannAPI.__ValidateRecordField(recordOfInterest, "start_time")
+        end_time: str       = SwannAPI.__ValidateRecordField(recordOfInterest, "end_time")
+
+        return f"swann_{channel}_{start_year}-{start_month}-{start_day}__{start_time.replace(':', '-')}__{end_time.replace(':', '-')}.mp4"
+
+    @staticmethod
+    def GetVideoFileDirectoryStructure(recordOfInterest: dict[str, str | int]) -> str:
+        """
+        This function is going to take a record a product a path to a file in a directory structure to organize the
+        video's. The structure is going to assume that there isn't going to be a video file that is going to span more
+        than a single date. The resulting path that is generated is going to look at follows:
+            "<start_year>/<start_month>/<start_day>/<channel>"
+        """
+        channel: str        = SwannAPI.__ValidateRecordField(recordOfInterest, "channel")
+        start_date: str             = SwannAPI.__ValidateRecordField(recordOfInterest, "start_date")
+        start_year: str             = start_date[6:]
+        start_month: str            = start_date[0:2]
+        start_day: str              = start_date[3:5]
+
+        return f"{start_year}/{start_month}/{start_day}/{channel}"
+
+    def DownloadVideoFile(self, recordOfInterest: dict[str, str | int], downloadDir: str, stdout: bool = True) -> str:
         self.__EnsureLogin()
 
         # The channel is given as a number instead of an index, we need to update that to fix it.
-        channel: str        = self.__ValidateRecordField(recordOfInterest, "channel")
+        channel: str        = SwannAPI.__ValidateRecordField(recordOfInterest, "channel")
         channel_index: str  = int(channel[2:]) - 1
         # The steam of the channel can either be "Mainstream" or "Substream".
-        stream_mode: str = self.__ValidateRecordField(recordOfInterest, "stream_mode")
+        stream_mode: str = SwannAPI.__ValidateRecordField(recordOfInterest, "stream_mode")
         stream_type: str = "0" if (stream_mode == "Mainstream") else "1"
         # Record type is indicating whether this is a normal clip or one of the intelligent clips that were taken.
-        record_type: str = self.__ValidateRecordField(recordOfInterest, "record_type")
+        record_type: str = SwannAPI.__ValidateRecordField(recordOfInterest, "record_type")
         # Start and end times are passed through to the query by just mashing them together and removing ":" and "/"
         # characters.
-        start_date: str             = self.__ValidateRecordField(recordOfInterest, "start_date")
-        start_time: str             = self.__ValidateRecordField(recordOfInterest, "start_time")
-        download_start_time: str    = self.__ConvertDateAndTimeToDownloadTimeString(start_date, start_time)
-        end_date: str               = self.__ValidateRecordField(recordOfInterest, "end_date")
-        end_time: str               = self.__ValidateRecordField(recordOfInterest, "end_time")
-        download_end_time: str      = self.__ConvertDateAndTimeToDownloadTimeString(end_date, end_time)
+        start_date: str             = SwannAPI.__ValidateRecordField(recordOfInterest, "start_date")
+        start_time: str             = SwannAPI.__ValidateRecordField(recordOfInterest, "start_time")
+        download_start_time: str    = SwannAPI.__ConvertDateAndTimeToDownloadTimeString(start_date, start_time)
+        end_date: str               = SwannAPI.__ValidateRecordField(recordOfInterest, "end_date")
+        end_time: str               = SwannAPI.__ValidateRecordField(recordOfInterest, "end_time")
+        download_end_time: str      = SwannAPI.__ConvertDateAndTimeToDownloadTimeString(end_date, end_time)
         # I assume that the record ID and the disk event ID are used to identify the recording file that is going to be
         # used to create the file that is going to be downloaded.
-        record_id: str      = self.__ValidateRecordField(recordOfInterest, "record_id")
-        disk_event_id: str  = self.__ValidateRecordField(recordOfInterest, "disk_event_id")
+        record_id: str      = SwannAPI.__ValidateRecordField(recordOfInterest, "record_id")
+        disk_event_id: str  = SwannAPI.__ValidateRecordField(recordOfInterest, "disk_event_id")
         # Store the Size of the file that we are going to download to help with tracking download progress.
-        size: int   = self.__ValidateRecordField(recordOfInterest, "size")
+        size: int   = SwannAPI.__ValidateRecordField(recordOfInterest, "size")
 
         downloadApiEndpoint: str = f"download.mp4?"
         downloadApiEndpoint += f"start_time={download_start_time}"
@@ -180,8 +241,14 @@ class SwannAPI():
         downloadApiEndpoint += f"&disk_event_id={disk_event_id}"
         downloadApiUrl = self.GetURLEndpoint(downloadApiEndpoint)
 
-        downloadFilePath: str = f"{path.abspath(downloadDir)}/swann_{download_start_time}_{download_end_time}.mp4"
-        self.__StreamAPIDownloadToFile(downloadFilePath, size, downloadApiUrl, {})
+        # Make sure that the target download directory exists
+        downloadFileDir: str = f"{path.abspath(downloadDir)}/{SwannAPI.GetVideoFileDirectoryStructure(recordOfInterest)}"
+        if not path.exists(downloadFileDir):
+            makedirs(downloadFileDir)
+
+        downloadFilePath: str = f"{downloadFileDir}/{SwannAPI.GetVideoFileName(recordOfInterest)}"
+        self.__StreamAPIDownloadToFile(downloadFilePath, size, downloadApiUrl, {}, stdout=False)
+        return downloadFilePath
 
     __error_code: dict[str, str] = {
         "param_error": "The requested data is invalid!",
@@ -407,8 +474,113 @@ class SwannAPI():
         "disk_unavailable_for_upgrade": "No HDD is installed! It is allowed to upgrade the firmware only when there is at least one fully-functioning HDD installed."
     }
 
-# if __name__ == "__main__":
-#     dvr: SwannAPI = SwannAPI("192.168.1.180:85", "admin", "pemdas11894")
-#     playbackRecords = dvr.SearchPlaybackRecords(1, date.today() - timedelta(days=1))
-#     downloadRecord = playbackRecords["data"]["record"][0][0]
-#     dvr.DownloadVideoFile(downloadRecord, "./")
+if __name__ == "__main__":
+    interrupted: bool = False
+    def signal_handler(signal, frame):
+        global interrupted
+        print("Interrupt signal received")
+        interrupted = True
+    signal.signal(signal.SIGINT, signal_handler)
+
+    downloadsDir: str = "downloads/"
+    compressDir: str = "compressed/"
+    dvr: SwannAPI = SwannAPI("192.168.1.200:85", "backup", "5&M8jDS*P5cFpf$S")
+
+    downloadThreadCount: int = 1
+    downloadThreads: list[Thread] = []
+    downloadQueue: Queue[dict[str, str | int]] = Queue()
+
+    compressThreadCount: int = 1
+    compressThreads: list[Thread] = []
+    compressQueue: Queue[str] = Queue()
+
+    startTime = time()
+
+    ##################################################
+    ## Add all the records of interest to the queue.
+    ##################################################
+    dateOfInterest: date = date.today() - timedelta(days=2)
+
+    playbackRecords = dvr.SearchPlaybackRecords(1, dateOfInterest)
+    for recordOfInterest in playbackRecords["data"]["record"][0]:
+        downloadQueue.put(recordOfInterest)
+
+    playbackRecords = dvr.SearchPlaybackRecords(2, dateOfInterest)
+    for recordOfInterest in playbackRecords["data"]["record"][0]:
+        downloadQueue.put(recordOfInterest)
+
+    dateOfInterest: date = date.today() - timedelta(days=1)
+
+    playbackRecords = dvr.SearchPlaybackRecords(1, dateOfInterest)
+    for recordOfInterest in playbackRecords["data"]["record"][0]:
+        downloadQueue.put(recordOfInterest)
+
+    playbackRecords = dvr.SearchPlaybackRecords(2, dateOfInterest)
+    for recordOfInterest in playbackRecords["data"]["record"][0]:
+        downloadQueue.put(recordOfInterest)
+
+    print(f"Downloading and processing {downloadQueue.qsize()} videos")
+
+    ##################################################
+    ## Download the Videos
+    ##################################################
+    def downloadVideoThread():
+        while not downloadQueue.empty() and not interrupted:
+            recordToDownload: dict[str, str | int] = downloadQueue.get()
+            recordFileName: str = SwannAPI.GetVideoFileName(recordToDownload)
+            print(f"Download starting: {recordFileName}")
+            downloadedFilePath: str = dvr.DownloadVideoFile(recordToDownload, downloadsDir, False)
+            print(f"Download complete: {recordFileName}")
+            compressQueue.put(downloadedFilePath)
+
+    for i in range(downloadThreadCount):
+        downloadThreads.append(Thread(target=downloadVideoThread))
+        downloadThreads[i].start()
+        # Offset starting the threads by half a second to avoid collisions when initially setting up the connection to
+        # download.
+        sleep(0.5)
+
+    ##################################################
+    ## Convert the Videos With ffmpeg
+    ##################################################
+    import ffmpeg
+    def convertVideoThread(thread_id: int):
+        # If the download queue is empty that means that there are no more files that are going to be added to the
+        # compress queue
+        while (not compressQueue.empty() or not downloadQueue.empty()) and not interrupted:
+            downloadFilePath = compressQueue.get(True)
+            compressFilePath = downloadFilePath.replace(downloadsDir, compressDir, 1)
+            compressFileDir = path.dirname(compressFilePath)
+            compressfileName = path.basename(compressFilePath)
+            if not path.exists(compressFileDir):
+                makedirs(compressFileDir)
+
+            # Print to console that we are starting the compression and when we have finished and what thread it
+            # corresponded to.
+            print(f"Compress ({thread_id}) starting: {compressfileName}")
+            ffmpeg.input(downloadFilePath).output(compressFilePath, vcodec="libx265", crf=28, preset="ultrafast", vf="scale=1920:-1", y="-y").run(quiet=True)
+            print(f"Compress ({thread_id}) complete: {compressfileName}")
+            print(f"Deleting file: {downloadFilePath}")
+            remove(downloadFilePath)
+
+    for i in range(compressThreadCount):
+        compressThreads.append(Thread(target=convertVideoThread, args=[i]))
+        compressThreads[i].start()
+        # Offset starting the threads by half a second to avoid collisions when initially setting up the conversion.
+        sleep(0.5)
+
+    # Wait for all downloads to be finished
+    for i in range(downloadThreadCount):
+        downloadThreads[i].join()
+
+    # Logout of the dvr when we are finished to avoid a problem with the heartbeat
+    dvr.Logout()
+
+    for i in range(compressThreadCount):
+        compressThreads[i].join()
+
+    endTime = time()
+
+    print(f"\nTotal elapsed time for process: {round(endTime - startTime)}")
+
+    sys.exit(0)
